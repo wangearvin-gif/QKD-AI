@@ -1,26 +1,29 @@
 """B5：在相同誤報率下，比較完整模型和 QBER 門檻偵測器抓到竊聽的比例。"""
 
-
+from collections import defaultdict
 from pathlib import Path
 
 from train_decision_tree import (
     FEATURE_COLUMNS,
     SimpleDecisionTree,
-    eavesdrop_metrics,
     load_dataset,
     train_test_split,
 )
 
-def qber_false_alarm(rows, threshold):
-    """正常的 block 裡，qber > threshold（被誤判成竊聽）的比例。"""
-    normal = [row for row in rows if row["label"] == "normal"]
-    return sum(row["qber"] > threshold for row in normal) / len(normal)
+def flag_rate_by_class(rows, flagged):
+    """每一類 block 裡，被判成竊聽（flagged 為 True）的比例。"""
+    counts = defaultdict(int)    # 每類總共幾個
+    hits = defaultdict(int)      # 每類被判成竊聽的有幾個
+    for row, flag in zip(rows, flagged):
+        counts[row["label"]] += 1
+        if flag:
+            hits[row["label"]] += 1
+    return {label: hits[label] / counts[label] for label in sorted(counts)}
 
-
-def qber_recall(rows, threshold):
-    """竊聽的 block 裡，qber > threshold（被抓到）的比例。"""
-    intercept_resend = [row for row in rows if row["label"] == "intercept_resend"]
-    return sum(row["qber"] > threshold for row in intercept_resend) / len(intercept_resend)
+def overall_false_alarm(rows, flagged):
+    """所有非竊聽 block 裡，被判成竊聽的比例。"""
+    pairs = [(row, flag) for row, flag in zip(rows, flagged) if row["label"] != "intercept_resend"]
+    return sum(flag for row, flag in pairs) / len(pairs)
 
 # 1. 讀資料、切分（參數跟訓練程式一樣，才會切出同一份測試集）
 rows = load_dataset(Path("data/qkd_dataset_diagnostic.csv"))
@@ -37,24 +40,38 @@ model.fit(train_rows)
 # 3. 預測測試集，算竊聽指標
 actual = [row["label"] for row in test_rows]
 predicted = [model.predict_one(row) for row in test_rows]
-full = eavesdrop_metrics(actual, predicted)
-print("完整模型：抓到率", full["recall"], "誤報率", full["false_alarm_rate"])
-for t in [0.0, 0.02, 0.05, 0.11]:
-    print(f"門檻 {t}：誤報率 {qber_false_alarm(test_rows, t):.1%}  抓到率 {qber_recall(test_rows, t):.1%}")
-target = full["false_alarm_rate"]   # 完整模型的誤報率，5.7%
-
+target = 0.05
 candidates = sorted({row["qber"] for row in train_rows if row["label"] == "normal"})
+best_t=None
 for t in candidates:
-    if qber_false_alarm(train_rows, t) <= target:
+    if flag_rate_by_class(train_rows, [row["qber"] > t for row in train_rows])["normal"] <= target:
         best_t = t
-        break   # 找到第一個符合的就停下來，Python 用哪個字跳出迴圈？
+        break   # 由小到大，第一個符合的就是最低門檻
+
+if best_t is None:
+    raise ValueError("找不到符合目標誤報率的門檻")
 
 # 協定門檻（BB84 常用 11%）
 protocol_t = 0.11
 
+# 決策樹：預測結果是 intercept_resend 就算「響」
+tree_flagged = [p == "intercept_resend" for p in predicted]
+
+# QBER 門檻：qber > 門檻 就算「響」
+qber_flagged = [row["qber"] > best_t for row in test_rows]
+
 print()
-print("| 方法 | 門檻 | 誤報率 | 抓到率 |")
-print("|---|---|---|---|")
-print(f"| 完整模型（決策樹，7 特徵） | — | {full['false_alarm_rate']:.1%} | {full['recall']:.1%} |")
-print(f"| QBER 門檻（訓練集挑選） | {best_t:.4f} | {qber_false_alarm(test_rows, best_t):.1%} |  {qber_recall(test_rows, best_t):.1%}|")
-print(f"| 協定門檻 | {protocol_t} |{qber_false_alarm(test_rows, protocol_t):.1%}| {qber_recall(test_rows, protocol_t):.1%}|")
+methods = [
+    ("完整模型（決策樹，7 特徵）", "—", tree_flagged),
+    ("QBER 門檻（目標 5%，訓練集挑選）", f"{best_t:.4f}", qber_flagged),
+    ("協定門檻", "0.11", [row["qber"] > protocol_t for row in test_rows]),
+]
+
+print("| 方法 | 門檻 | 竊聽檢出率 | 正常區塊誤報率 | 非竊聽整體誤報率 | 去極化 | 偏振漂移 | 光纖老化 |")
+print("|---|---|---|---|---|---|---|---|")
+for name, threshold, flagged in methods:
+    rate = flag_rate_by_class(test_rows, flagged)
+    overall = overall_false_alarm(test_rows, flagged)
+    print(f"| {name} | {threshold} | {rate['intercept_resend']:.1%} | {rate['normal']:.1%} | "
+          f"{overall:.1%} | {rate['depolarizing_noise']:.1%} | {rate['polarization_drift']:.1%} | "
+          f"{rate['fiber_aging']:.1%} |")
